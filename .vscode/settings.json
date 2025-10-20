@@ -1,4 +1,6 @@
 {
   "python-envs.pythonProjects": [],
-  "python-envs.defaultEnvManager": "ms-python.python:system"
+  "python-envs.defaultEnvManager": "ms-python.python:system",
+  "python.analysis.extraPaths": ["./your-venv/lib/site-packages"],
+  "python.analysis.diagnosticMode": "workspace"
 }

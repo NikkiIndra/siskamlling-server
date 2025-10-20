@@ -11,7 +11,8 @@ import json
 import time
 import traceback
 import requests
-import paho.mqtt.publish as publish  # ✅ tambahkan ini
+import uuid
+import paho.mqtt.publish as publish  
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from datetime import datetime
@@ -21,8 +22,12 @@ from collections import defaultdict
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 from flask_socketio import SocketIO, emit
+from models import Reports, ReportDuplicationCheck
+from flask_sqlalchemy import SQLAlchemy
+#import file utils
+from utils import check_similarity
 
-from db import get_connection
+from database_config import get_connection
 from tts_utils import generate_mp3
 
 import eventlet.wsgi
@@ -35,7 +40,18 @@ import inspect
 app = Flask(__name__)
 # keep original CORS config from your file
 CORS(app, resources={r"/*": {"origins": ["http://localhost:3000", "http://10.10.10.224:8080"]}})
+DB_USER = os.getenv("DB_USER", "root")
+DB_PASS = os.getenv("DB_PASS", "")
+DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
+DB_PORT = os.getenv("DB_PORT", "3306")
+DB_NAME = os.getenv("DB_NAME", "siskamling_digital")
 
+app.config["SQLALCHEMY_DATABASE_URI"] = (
+    f"mysql+pymysql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+)
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+db = SQLAlchemy(app)
 # SocketIO pakai eventlet mode
 socketio = SocketIO(
     app,
@@ -98,18 +114,221 @@ def publish_mqtt(code_desa, message):
     topic = f"desa/{code_desa}"
     publish.single(topic, message, hostname=MQTT_BROKER, port=MQTT_PORT)
 
+@app.route('/api/report/create', methods=['POST'])
+def create_report():
+    try:
+        jenis_laporan = request.form.get('jenis_laporan')
+        nama_pelapor = request.form.get('nama_pelapor')
+        alamat = request.form.get('alamat')
+        deskripsi = request.form.get('deskripsi')
+        tanggal = request.form.get('tanggal')
+        latitude = float(request.form.get('latitude'))
+        longitude = float(request.form.get('longitude'))
+        desa_id = int(request.form.get('desa_id'))
+        user_id = int(request.form.get('user_id'))
+
+        # Cek apakah user berhak melapor ke desa_id tersebut
+        # (misal pakai session auth: desa user harus sama)
+        header_desa = request.headers.get("X-Desa-Id")
+        if header_desa and int(header_desa) != desa_id:
+            return jsonify({"status": "error", "message": "Akses ditolak: desa tidak cocok"}), 403
+
+        # Upload foto
+        fotos = request.files.getlist('images')
+        foto_url = None
+        if fotos:
+            for foto in fotos:
+                filename = f"{uuid.uuid4().hex}_{secure_filename(foto.filename)}"
+                foto.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
+                foto_url = f"/static/uploads/{filename}"
+
+        # Ambil semua laporan dari desa yang sama
+        all_reports = Reports.query.filter_by(desa_id=desa_id).all()
+
+        # Buat sementara objek report_id untuk relasi check table
+        temp_report = Reports(
+            user_id=user_id,
+            desa_id=desa_id,
+            jenis_laporan=jenis_laporan,
+            nama_pelapor=nama_pelapor,
+            alamat=alamat,
+            latitude=latitude,
+            longitude=longitude,
+            tanggal=tanggal,
+            deskripsi=deskripsi,
+            foto_url=foto_url,
+            created_at=datetime.utcnow()
+        )
+        db.session.add(temp_report)
+        db.session.flush()
+
+        # Cek duplikasi dan simpan hasil ke tabel check
+        similarity_score, classification = check_similarity(
+            jenis_laporan, latitude, longitude, deskripsi, all_reports, temp_report.id
+        )
+
+        temp_report.status = classification
+        temp_report.similarity_score = similarity_score
+        db.session.commit()
+
+        return jsonify({
+            "status": "success",
+            "message": f"Laporan disimpan sebagai {classification}",
+            "similarity_score": similarity_score
+        })
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/api/report/list', methods=['GET'])
+def get_reports_by_desa():
+    try:
+        desa_id = request.headers.get("X-Desa-Id")
+        role = request.headers.get("X-User-Role")
+
+        if not desa_id:
+            return jsonify({"status": "error", "message": "Desa ID tidak ditemukan di header"}), 400
+
+        # Ambil laporan berdasarkan desa_id
+        reports = Reports.query.filter_by(desa_id=desa_id).order_by(Reports.created_at.desc()).all()
+
+        # Kalau role == "admin", bisa lihat semua status
+        # Kalau role == "user", bisa lihat hanya status tertentu (optional)
+        result = []
+        for r in reports:
+            result.append({
+                "id": r.id,
+                "jenis_laporan": r.jenis_laporan,
+                "nama_pelapor": r.nama_pelapor,
+                "alamat": r.alamat,
+                "deskripsi": r.deskripsi,
+                "latitude": r.latitude,
+                "longitude": r.longitude,
+                "tanggal": r.tanggal.strftime("%Y-%m-%d %H:%M:%S") if r.tanggal else None,
+                "foto_url": r.foto_url,
+                "status": r.status,
+                "similarity_score": r.similarity_score,
+                "created_at": r.created_at.strftime("%Y-%m-%d %H:%M:%S") if r.created_at else None,
+            })
+
+        return jsonify({
+            "status": "success",
+            "count": len(result),
+            "data": result
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/api/report/detail/<int:report_id>', methods=['GET'])
+def get_report_detail(report_id):
+    try:
+        desa_id = request.headers.get("X-Desa-Id")
+
+        if not desa_id:
+            return jsonify({"status": "error", "message": "Desa ID tidak ditemukan di header"}), 400
+
+        report = Reports.query.filter_by(id=report_id, desa_id=desa_id).first()
+
+        if not report:
+            return jsonify({"status": "error", "message": "Laporan tidak ditemukan atau tidak sesuai desa"}), 404
+
+        # Ambil semua hasil perbandingan duplikasi dari tabel check
+        dup_checks = ReportDuplicationCheck.query.filter_by(report_id=report.id).all()
+        comparisons = [
+            {
+                "compared_with_id": c.compared_with_id,
+                "jenis_score": c.jenis_score,
+                "lokasi_score": c.lokasi_score,
+                "deskripsi_score": c.deskripsi_score,
+                "total_score": c.total_score,
+                "classification": c.classification,
+                "checked_at": c.checked_at.strftime("%Y-%m-%d %H:%M:%S")
+            } for c in dup_checks
+        ]
+
+        return jsonify({
+            "status": "success",
+            "data": {
+                "id": report.id,
+                "jenis_laporan": report.jenis_laporan,
+                "nama_pelapor": report.nama_pelapor,
+                "alamat": report.alamat,
+                "deskripsi": report.deskripsi,
+                "latitude": report.latitude,
+                "longitude": report.longitude,
+                "tanggal": report.tanggal.strftime("%Y-%m-%d %H:%M:%S") if report.tanggal else None,
+                "foto_url": report.foto_url,
+                "status": report.status,
+                "similarity_score": report.similarity_score,
+                "created_at": report.created_at.strftime("%Y-%m-%d %H:%M:%S") if report.created_at else None,
+                "duplication_checks": comparisons
+            }
+        })
+
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/api/report/list/<status>', methods=['GET'])
+def get_reports_by_status(status):
+    try:
+        desa_id = request.headers.get("X-Desa-Id")
+        if not desa_id:
+            return jsonify({"status": "error", "message": "Desa ID tidak ditemukan di header"}), 400
+
+        valid_status = ['baru', 'indikasi_duplikasi', 'duplikasi']
+        if status not in valid_status:
+            return jsonify({"status": "error", "message": "Status tidak valid"}), 400
+
+        reports = Reports.query.filter_by(desa_id=desa_id, status=status).order_by(Reports.created_at.desc()).all()
+
+        result = [{
+            "id": r.id,
+            "jenis_laporan": r.jenis_laporan,
+            "nama_pelapor": r.nama_pelapor,
+            "alamat": r.alamat,
+            "deskripsi": r.deskripsi,
+            "foto_url": r.foto_url,
+            "status": r.status,
+            "similarity_score": r.similarity_score
+        } for r in reports]
+
+        return jsonify({"status": "success", "count": len(result), "data": result})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
 # Simple auth replacement for JWT:
 # - Reads user_id, role, desa_id from headers or query params.
 # - Sets them on flask.g for handlers to use.
 from functools import wraps
-
 def require_auth(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         # Try headers first
-        user_id = request.headers.get('X-User-Id') or request.args.get('user_id') or request.json.get('user_id') if request.is_json else None
-        role = request.headers.get('X-User-Role') or request.args.get('role') or (request.json.get('role') if request.is_json else None)
-        desa_id = request.headers.get('X-Desa-Id') or request.args.get('desa_id') or (request.json.get('desa_id') if request.is_json else None)
+        user_id = request.headers.get('X-User-Id') 
+        role = request.headers.get('X-User-Role') 
+        desa_id = request.headers.get('X-Desa-Id')
+        
+        # Jika tidak ada di header, coba dari form data (untuk multipart)
+        if not user_id:
+            user_id = request.form.get('user_id')
+        if not role:
+            role = request.form.get('role') 
+        if not desa_id:
+            desa_id = request.form.get('desa_id')
+            
+        # Jika masih tidak ada, coba dari query params
+        if not user_id:
+            user_id = request.args.get('user_id')
+        if not role:
+            role = request.args.get('role')
+        if not desa_id:
+            desa_id = request.args.get('desa_id')
+
+        # Debug logging
+        print(f"🔐 Auth Debug - Headers: {dict(request.headers)}")
+        print(f"🔐 Auth Debug - Form: {dict(request.form)}")
+        print(f"🔐 Auth Debug - Found: user_id={user_id}, role={role}, desa_id={desa_id}")
 
         # normalize types
         try:
@@ -131,7 +350,6 @@ def require_auth(f):
 
         return f(*args, **kwargs)
     return decorated
-
 # =====================================================
 # ROUTES (only JWT-related logic removed; rest preserved)
 # =====================================================
@@ -159,9 +377,8 @@ def get_users():
         fields = request.args.get("fields")
         allowed_columns = {
             "id", "nama_lengkap", "email", "rt", "rw", "blok",
-            "latlong", "role", "desa_id", "profile_image"
+            "latlong", "role", "desa_id", "profile_image, createdAt"
         }
-
         if fields:
             selected_fields = [f for f in fields.split(",") if f in allowed_columns]
             if not selected_fields:
@@ -329,12 +546,6 @@ def get_message_coords():
             "success": False,
             "message": f"Error: {str(e)}"
         }), 500
-
-# -------------------------
-# FILE UPLOAD HELPERS (already present)
-# -------------------------
-
-# konfigurasi MQTT is above
 
 # -------------------------
 # 1. SIGNUP ADMIN
@@ -896,6 +1107,171 @@ def _save_and_trigger(desa_id, user_id, text, filename, code_desa):
         "triggers": trigger_results
     }
 
+
+# -------------------------
+# ESP32 NOTIFICATION ENDPOINT
+# -------------------------
+@app.route("/notify-esp", methods=["POST"])
+def notify_esp():
+    try:
+        data = request.get_json()
+        code_desa = data.get("code_desa")
+        filename = data.get("filename")
+        play_count = data.get("play_count", 3)
+        
+        if not code_desa or not filename:
+            return jsonify({"success": False, "message": "code_desa dan filename wajib"}), 400
+        
+        # Dapatkan semua ESP32 dengan code_desa yang sesuai
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+        
+        cursor.execute("""
+            SELECT id.device_ip 
+            FROM iot_device id
+            JOIN desa d ON id.desa_id = d.id
+            WHERE d.code_desa = %s
+        """, (code_desa,))
+        
+        devices = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        
+        if not devices:
+            return jsonify({"success": False, "message": "Tidak ada ESP32 terdaftar untuk desa ini"}), 404
+        
+        # Kirim notifikasi ke semua ESP32 yang sesuai
+        notification_results = []
+        for device in devices:
+            device_ip = device["device_ip"]
+            success = send_esp_notification(device_ip, filename, play_count)
+            notification_results.append({
+                "device_ip": device_ip,
+                "status": "success" if success else "failed"
+            })
+        
+        return jsonify({
+            "success": True,
+            "message": f"Notifikasi dikirim ke {len(devices)} ESP32",
+            "results": notification_results
+        })
+        
+    except Exception as e:
+        log_exc("=== ERROR notify_esp ===")
+        return jsonify({"success": False, "message": str(e)}), 500
+
+def send_esp_notification(device_ip, filename, play_count):
+    """Kirim notifikasi ke ESP32 tertentu"""
+    try:
+        notification_url = f"http://{device_ip}/notify"
+        payload = {
+            "filename": filename,
+            "play_count": play_count,
+            "audio_url": f"http://{os.environ.get('PUBLIC_HOST','192.168.0.99')}:5000/audio/{filename}"
+        }
+        
+        response = requests_session.post(
+            notification_url, 
+            json=payload, 
+            timeout=5
+        )
+        return response.status_code == 200
+    except Exception as e:
+        print(f"❌ Gagal kirim notifikasi ke {device_ip}: {e}")
+        return False
+
+# Modifikasi fungsi _save_and_trigger_laporan untuk menambahkan notifikasi ESP
+def _save_and_trigger_laporan(desa_id, user_id, text, filename, code_desa, category):
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True, buffered=True)
+
+    cursor.execute("""
+        INSERT INTO messages (desa_id, user_id, description, tts_url, category)
+        VALUES (%s, %s, %s, %s, %s)
+    """, (desa_id, user_id, text, filename, category))
+    conn.commit()
+
+    # Kirim notifikasi ke ESP32 dengan code_desa yang sesuai
+    notify_result = send_esp_notification_by_desa(code_desa, filename)
+    
+    cursor.close()
+    conn.close()
+
+    return {
+        "success": True,
+        "message": "Laporan berhasil disimpan dan notifikasi dikirim ke ESP32",
+        "file": filename,
+        "audio_url": f"http://{os.environ.get('PUBLIC_HOST','192.168.0.99')}:5000/audio/{filename}",
+        "esp_notification": notify_result
+    }
+
+def send_esp_notification_by_desa(code_desa, filename, play_count=3):
+    """Kirim notifikasi ke semua ESP32 dengan code_desa tertentu"""
+    try:
+        notification_url = f"http://{os.environ.get('PUBLIC_HOST','192.168.0.99')}:5000/notify-esp"
+        payload = {
+            "code_desa": code_desa,
+            "filename": filename,
+            "play_count": play_count
+        }
+        
+        response = requests_session.post(
+            notification_url, 
+            json=payload, 
+            timeout=10
+        )
+        return response.json()
+    except Exception as e:
+        print(f"❌ Gagal kirim notifikasi massal: {e}")
+        return {"success": False, "error": str(e)}
+
+# endpoint untuk register ESP32 otomatis:
+@app.route("/register-esp", methods=["POST"])
+def register_esp():
+    """Endpoint untuk ESP32 register IP otomatis"""
+    try:
+        data = request.get_json()
+        device_ip = request.remote_addr
+        code_desa = data.get("code_desa")
+        
+        print(f"📝 ESP Registration - IP: {device_ip}, Code Desa: {code_desa}")
+        
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+        
+        # Cari desa_id berdasarkan code_desa
+        cursor.execute("SELECT id FROM desa WHERE code_desa = %s", (code_desa,))
+        desa = cursor.fetchone()
+        
+        if not desa:
+            return jsonify({"success": False, "message": "Kode desa tidak ditemukan"}), 400
+        
+        desa_id = desa["id"]
+        
+        # Update atau insert device
+        cursor.execute("""
+            INSERT INTO iot_device (device_ip, desa_id, created_at) 
+            VALUES (%s, %s, NOW())
+            ON DUPLICATE KEY UPDATE device_ip = VALUES(device_ip)
+        """, (device_ip, desa_id))
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        print(f"✅ ESP registered/updated - IP: {device_ip}, Desa ID: {desa_id}")
+        
+        return jsonify({
+            "success": True, 
+            "message": "ESP registered successfully",
+            "ip_address": device_ip,
+            "desa_id": desa_id
+        })
+        
+    except Exception as e:
+        print(f"❌ ESP registration failed: {e}")
+        return jsonify({"success": False, "message": str(e)}), 500
+    
 # -------------------------
 # WebSocket connection (no JWT) - read from query params
 # -------------------------
@@ -1061,45 +1437,45 @@ def lapor_manual():
 # -------------------------
 # ENPOINT ESP32 DOWNLOAD AUDIO
 # -------------------------
-def _save_and_trigger_laporan(desa_id, user_id, text, filename, code_desa, category):
-    conn = get_connection()
-    cursor = conn.cursor(dictionary=True, buffered=True)
+# def _save_and_trigger_laporan(desa_id, user_id, text, filename, code_desa, category):
+#     conn = get_connection()
+#     cursor = conn.cursor(dictionary=True, buffered=True)
 
-    cursor.execute("""
-        INSERT INTO messages (desa_id, user_id, description, tts_url, category)
-        VALUES (%s, %s, %s, %s, %s)
-    """, (desa_id, user_id, text, filename, category))
-    conn.commit()
+#     cursor.execute("""
+#         INSERT INTO messages (desa_id, user_id, description, tts_url, category)
+#         VALUES (%s, %s, %s, %s, %s)
+#     """, (desa_id, user_id, text, filename, category))
+#     conn.commit()
 
-    cursor.execute("SELECT * FROM iot_device WHERE desa_id=%s", (desa_id,))
-    devices = cursor.fetchall()
-    cursor.close()
-    conn.close()
+#     cursor.execute("SELECT * FROM iot_device WHERE desa_id=%s", (desa_id,))
+#     devices = cursor.fetchall()
+#     cursor.close()
+#     conn.close()
 
-    if not devices:
-        return {
-            "success": True,
-            "message": "Laporan berhasil disimpan, tapi tidak ada device ESP untuk desa ini",
-            "file": filename,
-            "audio_url": f"http://{os.environ.get('PUBLIC_HOST','192.168.0.99')}:5000/audio/{filename}"
-        }
+#     if not devices:
+#         return {
+#             "success": True,
+#             "message": "Laporan berhasil disimpan, tapi tidak ada device ESP untuk desa ini",
+#             "file": filename,
+#             "audio_url": f"http://{os.environ.get('PUBLIC_HOST','192.168.0.99')}:5000/audio/{filename}"
+#         }
 
-    trigger_results = []
-    for device in devices:
-        device_ip = device.get("device_ip")
-        success = trigger_esp_device(device_ip, filename)
-        trigger_results.append({
-            "device": device_ip,
-            "status": "triggered" if success else "failed"
-        })
+#     trigger_results = []
+#     for device in devices:
+#         device_ip = device.get("device_ip")
+#         success = trigger_esp_device(device_ip, filename)
+#         trigger_results.append({
+#             "device": device_ip,
+#             "status": "triggered" if success else "failed"
+#         })
 
-    return {
-        "success": True,
-        "message": "Laporan berhasil dikirim ke ESP devices",
-        "file": filename,
-        "audio_url": f"http://{os.environ.get('PUBLIC_HOST','192.168.0.99')}:5000/audio/{filename}",
-        "triggers": trigger_results
-    }
+#     return {
+#         "success": True,
+#         "message": "Laporan berhasil dikirim ke ESP devices",
+#         "file": filename,
+#         "audio_url": f"http://{os.environ.get('PUBLIC_HOST','192.168.0.99')}:5000/audio/{filename}",
+#         "triggers": trigger_results
+#     }
 
 def trigger_esp_device(device_ip, filename, play_count=2):
     try:
@@ -1362,7 +1738,6 @@ def upload_news():
             "success": False,
             "message": f"Error: {str(e)}"
         }), 500
-
 @app.route("/upload-news-with-image", methods=["POST"])
 @require_auth
 def upload_news_with_image():
@@ -1371,16 +1746,22 @@ def upload_news_with_image():
         role = g.role
         desa_id = g.desa_id
 
+        print(f"📰 Upload news - user_id: {user_id}, role: {role}, desa_id: {desa_id}")
+
         if role != "admin":
             return jsonify({
                 "success": False,
                 "message": "Hanya admin yang bisa upload berita"
             }), 403
 
-        file = request.files.get('image')
+        # Get files and form data
+        files = request.files.getlist('image')  # Support multiple files
         title = request.form.get('title')
         description = request.form.get('description')
         source = request.form.get('source', 'Admin Desa')
+
+        print(f"📝 Form data - title: {title}, description: {description}, source: {source}")
+        print(f"🖼️ Files received: {[f.filename for f in files]}")
 
         if not all([title, description]):
             return jsonify({
@@ -1388,20 +1769,26 @@ def upload_news_with_image():
                 "message": "Judul dan deskripsi wajib diisi"
             }), 400
 
-        image_path = None
+        image_paths = []
 
-        if file and allowed_file(file.filename):
-            NEWS_IMAGES_FOLDER = os.path.join(UPLOAD_FOLDER, 'news_images')
-            os.makedirs(NEWS_IMAGES_FOLDER, exist_ok=True)
+        # Handle multiple images (max 2 as per your Flutter code)
+        for file in files[:2]:  # Limit to 2 files
+            if file and file.filename != '' and allowed_file(file.filename):
+                NEWS_IMAGES_FOLDER = os.path.join(UPLOAD_FOLDER, 'news_images')
+                os.makedirs(NEWS_IMAGES_FOLDER, exist_ok=True)
 
-            filename = secure_filename(file.filename)
-            timestamp = str(int(time.time()))
-            file_extension = filename.rsplit('.', 1)[1].lower()
-            filename = f"news_{desa_id}_{timestamp}.{file_extension}"
-            filepath = os.path.join(NEWS_IMAGES_FOLDER, filename)
-            file.save(filepath)
+                filename = secure_filename(file.filename)
+                timestamp = str(int(time.time()))
+                file_extension = filename.rsplit('.', 1)[1].lower()
+                new_filename = f"news_{desa_id}_{timestamp}_{len(image_paths)}.{file_extension}"
+                filepath = os.path.join(NEWS_IMAGES_FOLDER, new_filename)
+                file.save(filepath)
 
-            image_path = f"news_images/{filename}"
+                image_paths.append(f"news_images/{new_filename}")
+                print(f"✅ Saved image: {new_filename}")
+
+        # Join image paths with comma for database storage
+        image_path = ','.join(image_paths) if image_paths else None
 
         conn = get_connection()
         cursor = conn.cursor()
@@ -1416,11 +1803,18 @@ def upload_news_with_image():
         cursor.close()
         conn.close()
 
+        # Prepare response with image URLs
+        image_urls = []
+        if image_paths:
+            for img_path in image_paths:
+                image_urls.append(f"http://{os.environ.get('PUBLIC_HOST','192.168.0.99')}:5000/uploads/{img_path}")
+
         return jsonify({
             "success": True,
-            "message": "Berita berhasil disimpan ke tabel news",
+            "message": "Berita berhasil disimpan",
             "news_id": news_id,
-            "image_url": image_path
+            "image_paths": image_paths,
+            "image_urls": image_urls
         }), 201
 
     except Exception as e:
@@ -1429,15 +1823,13 @@ def upload_news_with_image():
             "success": False,
             "message": f"Error: {str(e)}"
         }), 500
-
+    
 @app.route("/news", methods=["GET"])
 @require_auth
 def get_news():
     try:
         desa_id = g.desa_id
-
         print(f"📰 Fetching news for desa_id: {desa_id}")
-
         conn = get_connection()
         cursor = conn.cursor(dictionary=True)
 
@@ -1636,6 +2028,200 @@ def get_news_statistics():
             "message": f"Error: {str(e)}"
         }), 500
 
+# -------------------------
+# GET REPORT SUMMARY (Today, Week, Month) - VERSI ALTERNATIF
+# -------------------------
+@app.route("/messages/summary", methods=["GET"])
+@require_auth
+def get_report_summary():
+    try:
+        desa_id = g.desa_id
+        role = g.role
+
+        print(f"📊 Fetching report summary for desa_id: {desa_id}")
+
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        # Nama bulan dalam bahasa Indonesia
+        month_names = {
+            1: 'Januari', 2: 'Februari', 3: 'Maret', 4: 'April',
+            5: 'Mei', 6: 'Juni', 7: 'Juli', 8: 'Agustus',
+            9: 'September', 10: 'Oktober', 11: 'November', 12: 'Desember'
+        }
+
+        # Base condition untuk filter desa
+        desa_condition = "WHERE u.desa_id = %s" if role != "superadmin" else ""
+        params = [desa_id] if role != "superadmin" else []
+
+        # Hitung hari ini
+        today_query = f"""
+            SELECT COUNT(*) as count 
+            FROM messages m
+            {"JOIN user u ON m.user_id = u.id" if role != "superadmin" else ""}
+            {desa_condition}
+            AND DATE(m.created_at) = CURDATE()
+        """
+        cursor.execute(today_query, params)
+        today_result = cursor.fetchone()
+        today_count = today_result['count'] if today_result else 0
+
+        # Hitung minggu ini (minggu dalam bulan)
+        current_day = datetime.now().day
+        current_week = ((current_day - 1) // 7) + 1
+        
+        # Tentukan awal dan akhir minggu
+        week_start_day = ((current_week - 1) * 7) + 1
+        week_end_day = min(current_week * 7, 31)
+        
+        # Dapatkan tahun dan bulan saat ini
+        current_year = datetime.now().year
+        current_month = datetime.now().month
+        
+        # Buat tanggal untuk minggu ini
+        week_start = datetime(current_year, current_month, week_start_day)
+        week_end = datetime(current_year, current_month, week_end_day)
+        
+        # Hitung laporan minggu ini
+        week_query = f"""
+            SELECT COUNT(*) as count 
+            FROM messages m
+            {"JOIN user u ON m.user_id = u.id" if role != "superadmin" else ""}
+            {desa_condition}
+            AND DATE(m.created_at) BETWEEN %s AND %s
+        """
+        week_params = params + [week_start.date(), week_end.date()]
+        cursor.execute(week_query, week_params)
+        week_result = cursor.fetchone()
+        week_count = week_result['count'] if week_result else 0
+
+        # Hitung bulan ini
+        month_query = f"""
+            SELECT COUNT(*) as count 
+            FROM messages m
+            {"JOIN user u ON m.user_id = u.id" if role != "superadmin" else ""}
+            {desa_condition}
+            AND MONTH(m.created_at) = MONTH(CURDATE()) 
+            AND YEAR(m.created_at) = YEAR(CURDATE())
+        """
+        cursor.execute(month_query, params)
+        month_result = cursor.fetchone()
+        month_count = month_result['count'] if month_result else 0
+
+        cursor.close()
+        conn.close()
+
+        month_name = month_names.get(current_month, 'Bulan')
+
+        print(f"📊 Summary - Today: {today_count}, Week {current_week}: {week_count}, Month: {month_count}")
+
+        return jsonify({
+            "success": True,
+            "data": {
+                "today": today_count,
+                "week": week_count,
+                "month": month_count,
+                "current_week": f"Minggu-{current_week}",
+                "current_month": month_name,
+                "year": current_year
+            }
+        }), 200
+
+    except Exception as e:
+        print("❌ ERROR get_report_summary:", e)
+        return jsonify({
+            "success": False,
+            "message": f"Error: {str(e)}"
+        }), 500
+    
+# -------------------------
+# GET CHART DATA FOR TREND ANALYSIS
+# -------------------------
+@app.route("/messages/chart-data", methods=["GET"])
+@require_auth
+def get_chart_data():
+    try:
+        desa_id = g.desa_id
+        role = g.role
+
+        print(f"📊 Fetching chart data for desa_id: {desa_id} | role: {role}")
+
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        # Query untuk mendapatkan data per bulan dengan kategori
+        if role == "superadmin":
+            cursor.execute("""
+                SELECT 
+                    DATE_FORMAT(created_at, '%Y-%m') as month,
+                    SUM(CASE WHEN category = 'kemalingan' THEN 1 ELSE 0 END) as kemalingan,
+                    SUM(CASE WHEN category = 'medis' THEN 1 ELSE 0 END) as medis,
+                    SUM(CASE WHEN category = 'kebakaran' THEN 1 ELSE 0 END) as kebakaran,
+                    COUNT(*) as total
+                FROM messages 
+                WHERE created_at >= DATE_SUB(NOW(), INTERVAL 6 MONTH)
+                GROUP BY DATE_FORMAT(created_at, '%Y-%m')
+                ORDER BY month ASC
+            """)
+        else:
+            cursor.execute("""
+                SELECT 
+                    DATE_FORMAT(m.created_at, '%Y-%m') as month,
+                    SUM(CASE WHEN m.category = 'kemalingan' THEN 1 ELSE 0 END) as kemalingan,
+                    SUM(CASE WHEN m.category = 'medis' THEN 1 ELSE 0 END) as medis,
+                    SUM(CASE WHEN m.category = 'kebakaran' THEN 1 ELSE 0 END) as kebakaran,
+                    COUNT(*) as total
+                FROM messages m
+                JOIN user u ON m.user_id = u.id
+                WHERE u.desa_id = %s 
+                AND m.created_at >= DATE_SUB(NOW(), INTERVAL 6 MONTH)
+                GROUP BY DATE_FORMAT(m.created_at, '%Y-%m')
+                ORDER BY month ASC
+            """, (desa_id,))
+
+        chart_data = cursor.fetchall()
+        cursor.close()
+        conn.close()
+
+        print(f"📊 Found {len(chart_data)} months of chart data")
+
+        # Format nama bulan dalam bahasa Indonesia
+        month_names = {
+            '01': 'Jan', '02': 'Feb', '03': 'Mar', '04': 'Apr',
+            '05': 'Mei', '06': 'Jun', '07': 'Jul', '08': 'Agu',
+            '09': 'Sep', '10': 'Okt', '11': 'Nov', '12': 'Des'
+        }
+
+        formatted_data = []
+        for data in chart_data:
+            year_month = data['month']
+            year, month = year_month.split('-')
+            month_name = month_names.get(month, month)
+            display_name = f"{month_name} {year}"
+
+            formatted_data.append({
+                "month": display_name,
+                "month_raw": year_month,
+                "kemalingan": int(data['kemalingan']),
+                "medis": int(data['medis']),
+                "kebakaran": int(data['kebakaran']),
+                "total": int(data['total'])
+            })
+
+        return jsonify({
+            "success": True,
+            "data": formatted_data,
+            "total_months": len(formatted_data)
+        }), 200
+
+    except Exception as e:
+        print("❌ ERROR get_chart_data:", e)
+        return jsonify({
+            "success": False,
+            "message": f"Error: {str(e)}"
+        }), 500
+
+
 # ==========================
 # Eventlet server patch (keep as original)
 # ==========================
@@ -1648,6 +2234,9 @@ if 'ping_timeout' not in inspect.signature(eventlet.wsgi.server).parameters:
         return old_server(*args, **kwargs)
 
     eventlet.wsgi.server = patched_server
+
+
+
 
 # ==========================
 # Main Runner

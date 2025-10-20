@@ -13,3 +13,8 @@ werkzeug
 passlib[bcrypt]
 urllib3
 dotenv
+geopy
+Flask-SQLAlchemy
+pymysql
+python-dotenv
+# pip install -r requirements.txt

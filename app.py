@@ -1897,7 +1897,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 from flask_socketio import SocketIO, emit
 
-from db import get_connection
+from database_config import get_connection
 from tts_utils import generate_mp3
 import inspect
 
