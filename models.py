@@ -3,7 +3,7 @@ db = SQLAlchemy()
 
 
 class Reports(db.Model):
-    __tablename__ = 'siskamling_digital_reports'
+    __tablename__ = 'reports'
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, nullable=False)
     desa_id = db.Column(db.Integer, nullable=False)
@@ -20,7 +20,7 @@ class Reports(db.Model):
     created_at = db.Column(db.DateTime)
 
 class ReportDuplicationCheck(db.Model):
-    __tablename__ = 'siskamling_digital_report_duplication_check'
+    __tablename__ = 'report_duplication_check'
     id = db.Column(db.Integer, primary_key=True)
     report_id = db.Column(db.Integer)
     compared_with_id = db.Column(db.Integer)

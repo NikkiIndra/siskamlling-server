@@ -31,7 +31,6 @@ from database_config import get_connection
 from tts_utils import generate_mp3
 
 import eventlet.wsgi
-
 import inspect
 
 # ==========================
@@ -39,19 +38,30 @@ import inspect
 # ==========================
 app = Flask(__name__)
 # keep original CORS config from your file
-CORS(app, resources={r"/*": {"origins": ["http://localhost:3000", "http://10.10.10.224:8080"]}})
+CORS(app, supports_credentials=True)
+
 DB_USER = os.getenv("DB_USER", "root")
 DB_PASS = os.getenv("DB_PASS", "")
 DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
 DB_PORT = os.getenv("DB_PORT", "3306")
 DB_NAME = os.getenv("DB_NAME", "siskamling_digital")
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+UPLOAD_FOLDER = os.path.join(BASE_DIR, 'static', 'uploads')
+
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+
 app.config["SQLALCHEMY_DATABASE_URI"] = (
     f"mysql+pymysql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 )
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
-db = SQLAlchemy(app)
+
+from models import db, Reports, ReportDuplicationCheck
+db.init_app(app)
+
+
 # SocketIO pakai eventlet mode
 socketio = SocketIO(
     app,
@@ -121,12 +131,22 @@ def create_report():
         nama_pelapor = request.form.get('nama_pelapor')
         alamat = request.form.get('alamat')
         deskripsi = request.form.get('deskripsi')
-        tanggal = request.form.get('tanggal')
+        tanggal_str = request.form.get('tanggal')  # '2025-10-20'
+        tanggal = datetime.strptime(tanggal_str, '%Y-%m-%d')
         latitude = float(request.form.get('latitude'))
         longitude = float(request.form.get('longitude'))
         desa_id = int(request.form.get('desa_id'))
         user_id = int(request.form.get('user_id'))
 
+        if not desa_id or not user_id:
+            return jsonify({"status": "error", "message": "desa_id atau user_id kosong"}), 400
+
+        desa_id = int(desa_id)
+        user_id = int(user_id)
+        print("🛰️ Kirim laporan:");
+        print("desa_id: $desaId, user_id: $userId");
+        print("latitude: $latitude, longitude: $longitude");
+        print("images: ${imageFiles.length}");
         # Cek apakah user berhak melapor ke desa_id tersebut
         # (misal pakai session auth: desa user harus sama)
         header_desa = request.headers.get("X-Desa-Id")
@@ -176,10 +196,10 @@ def create_report():
             "message": f"Laporan disimpan sebagai {classification}",
             "similarity_score": similarity_score
         })
-
+    
     except Exception as e:
         db.session.rollback()
-        return jsonify({"status": "error", "message": str(e)}), 500
+        return jsonify({"status": "error", "message": "Format tanggal salah"}), 400
 
 @app.route('/api/report/list', methods=['GET'])
 def get_reports_by_desa():
@@ -2235,9 +2255,6 @@ if 'ping_timeout' not in inspect.signature(eventlet.wsgi.server).parameters:
 
     eventlet.wsgi.server = patched_server
 
-
-
-
 # ==========================
 # Main Runner
 # ==========================
@@ -2247,7 +2264,7 @@ if __name__ == "__main__":
         app,
         host="0.0.0.0",
         port=5000,
-        debug=False,
+        debug=True,
         allow_unsafe_werkzeug=True,
         ping_timeout=60,
         ping_interval=25
