@@ -9,7 +9,7 @@ app = Flask(__name__)
 CORS(app)
 
 AUDIO_DIR = "audio"
-ESP32_IP = "http://10.135.231.57:8080"  # Ganti dengan IP ESP32 kamu
+ESP32_IP = "http://10.234.3.57:8080"  # Ganti dengan IP ESP32 kamu
 
 if not os.path.exists(AUDIO_DIR):
     os.makedirs(AUDIO_DIR)
@@ -31,8 +31,8 @@ def receive_report():
     )
 
     # Buat file nama unik
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"alert_{timestamp}.mp3"
+    # timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"temp.mp3"
     filepath = os.path.join(AUDIO_DIR, filename)
 
     # Generate suara dengan gTTS
