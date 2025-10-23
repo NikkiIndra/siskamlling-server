@@ -13,6 +13,10 @@ import traceback
 import requests
 import uuid
 import paho.mqtt.publish as publish  
+import redis
+from flask_caching import Cache
+from rq import Queue
+from rq.job import Job
 from gtts import gTTS
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -40,6 +44,20 @@ import inspect
 app = Flask(__name__)
 # keep original CORS config from your file
 CORS(app, supports_credentials=True)
+
+# ====== Redis config (env-overridable) ======
+REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+redis_conn = redis.from_url(REDIS_URL)
+# Initialize Flask-Caching
+cache_config = {
+    "CACHE_TYPE": "RedisCache",
+    "CACHE_REDIS_URL": REDIS_URL,
+    "CACHE_DEFAULT_TIMEOUT": 30  # default 30s (tuneable)
+}
+app.config.from_mapping(cache_config)
+cache = Cache(app)
+# RQ queue for background tasks
+rq_queue = Queue("reports", connection=redis_conn)
 
 DB_USER = os.getenv("DB_USER", "root")
 DB_PASS = os.getenv("DB_PASS", "")
@@ -70,6 +88,12 @@ socketio = SocketIO(
     async_mode="eventlet",
     message_queue=os.environ.get("REDIS_URL")
 )
+
+# @socketio.on("join_room")
+# def handle_join_room(data):
+#     desa_id = data.get("desa_id")
+#     join_room(f"desa_{desa_id}")
+
 
 # ==========================
 # GLOBAL REQUESTS SESSION
@@ -134,34 +158,26 @@ def publish_mqtt(code_desa, message):
 
 @app.route('/api/report/create', methods=['POST'])
 def create_report():
+    """
+    Fast path: save report record quickly with status 'pending',
+    then enqueue background job to run check_similarity and update the record.
+    """
     try:
         jenis_laporan = request.form.get('jenis_laporan')
         nama_pelapor = request.form.get('nama_pelapor')
         alamat = request.form.get('alamat')
         deskripsi = request.form.get('deskripsi')
-        tanggal_str = request.form.get('tanggal')  # '2025-10-20'
-        tanggal = datetime.strptime(tanggal_str, '%Y-%m-%d')
-        latitude = float(request.form.get('latitude'))
-        longitude = float(request.form.get('longitude'))
+        tanggal_str = request.form.get('tanggal')  # 'YYYY-MM-DD'
+        tanggal = datetime.strptime(tanggal_str, '%Y-%m-%d') if tanggal_str else None
+        latitude = float(request.form.get('latitude')) if request.form.get('latitude') else None
+        longitude = float(request.form.get('longitude')) if request.form.get('longitude') else None
         desa_id = int(request.form.get('desa_id'))
         user_id = int(request.form.get('user_id'))
 
         if not desa_id or not user_id:
             return jsonify({"status": "error", "message": "desa_id atau user_id kosong"}), 400
 
-        desa_id = int(desa_id)
-        user_id = int(user_id)
-        print("🛰️ Kirim laporan:");
-        print("desa_id: $desaId, user_id: $userId");
-        print("latitude: $latitude, longitude: $longitude");
-        print("images: ${imageFiles.length}");
-        # Cek apakah user berhak melapor ke desa_id tersebut
-        # (misal pakai session auth: desa user harus sama)
-        header_desa = request.headers.get("X-Desa-Id")
-        if header_desa and int(header_desa) != desa_id:
-            return jsonify({"status": "error", "message": "Akses ditolak: desa tidak cocok"}), 403
-
-        # Upload foto
+        # Upload photo(s) as before (kept)
         fotos = request.files.getlist('images')
         foto_url = None
         if fotos:
@@ -170,10 +186,8 @@ def create_report():
                 foto.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
                 foto_url = f"/static/uploads/{filename}"
 
-        # Ambil semua laporan dari desa yang sama
-        all_reports = Reports.query.filter_by(desa_id=desa_id).all()
-
-        # Buat sementara objek report_id untuk relasi check table
+        # Create temporary report quick
+        # ly with status 'pending'
         temp_report = Reports(
             user_id=user_id,
             desa_id=desa_id,
@@ -185,66 +199,90 @@ def create_report():
             tanggal=tanggal,
             deskripsi=deskripsi,
             foto_url=foto_url,
-            created_at=datetime.utcnow()
+            created_at=datetime.utcnow(),
+            status='pending',           # immediately mark pending
+            similarity_score=None
         )
         db.session.add(temp_report)
-        db.session.flush()
-
-        # Cek duplikasi dan simpan hasil ke tabel check
-        similarity_score, classification = check_similarity(
-            jenis_laporan, latitude, longitude, deskripsi, all_reports, temp_report.id
-        )
-
-        temp_report.status = classification
-        temp_report.similarity_score = similarity_score
         db.session.commit()
+
+        # ENQUEUE background job to compute similarity
+        # We will pass the necessary minimal info: report_id and desa_id and the text fields
+        job = rq_queue.enqueue(
+            'worker_report_duplication.process_report_duplication',
+            temp_report.id,
+            jenis_laporan,
+            latitude,
+            longitude,
+            deskripsi,
+            desa_id,
+            job_timeout=120  # seconds, tuneable
+        )
 
         return jsonify({
             "status": "success",
-            "message": f"Laporan disimpan sebagai {classification}",
-            "similarity_score": similarity_score
-        })
-    
+            "message": "Laporan disimpan (diproses background)",
+            "report_id": temp_report.id,
+            "job_id": job.get_id()
+        }), 202
+
     except Exception as e:
         db.session.rollback()
-        return jsonify({"status": "error", "message": "Format tanggal salah"}), 400
+        log_exc("=== ERROR create_report (fast path) ===")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route('/api/report/list', methods=['GET'])
 def get_reports_by_desa():
     try:
         desa_id = request.headers.get("X-Desa-Id")
         role = request.headers.get("X-User-Role")
-
         if not desa_id:
             return jsonify({"status": "error", "message": "Desa ID tidak ditemukan di header"}), 400
 
-        # Ambil laporan berdasarkan desa_id
-        reports = Reports.query.filter_by(desa_id=desa_id).order_by(Reports.created_at.desc()).all()
+        page = int(request.args.get("page", 1))
+        per_page = int(request.args.get("per_page", 50))
+        offset = (page - 1) * per_page
+        cache_key = f"reports:{desa_id}:{role}:page{page}:per{per_page}"
+        cached = cache.get(cache_key)
+        if cached:
+            return jsonify(cached)
 
-        # Kalau role == "admin", bisa lihat semua status
-        # Kalau role == "user", bisa lihat hanya status tertentu (optional)
+        # use raw SQL with LIMIT/OFFSET to avoid loading all into memory
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT id, jenis_laporan, nama_pelapor, alamat, deskripsi, latitude, longitude,
+            tanggal, foto_url, status, similarity_score, created_at
+            FROM reports
+            WHERE desa_id = %s
+            ORDER BY created_at DESC
+            LIMIT %s OFFSET %s
+        """, (desa_id, per_page, offset))
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
+
         result = []
-        for r in reports:
+        for r in rows:
             result.append({
-                "id": r.id,
-                "jenis_laporan": r.jenis_laporan,
-                "nama_pelapor": r.nama_pelapor,
-                "alamat": r.alamat,
-                "deskripsi": r.deskripsi,
-                "latitude": r.latitude,
-                "longitude": r.longitude,
-                "tanggal": r.tanggal.strftime("%Y-%m-%d %H:%M:%S") if r.tanggal else None,
-                "foto_url": r.foto_url,
-                "status": r.status,
-                "similarity_score": r.similarity_score,
-                "created_at": r.created_at.strftime("%Y-%m-%d %H:%M:%S") if r.created_at else None,
+                "id": r["id"],
+                "jenis_laporan": r["jenis_laporan"],
+                "nama_pelapor": r["nama_pelapor"],
+                "alamat": r["alamat"],
+                "deskripsi": r["deskripsi"],
+                "latitude": r["latitude"],
+                "longitude": r["longitude"],
+                "tanggal": r["tanggal"].strftime("%Y-%m-%d %H:%M:%S") if r["tanggal"] else None,
+                "foto_url": r["foto_url"],
+                "status": r["status"],
+                "similarity_score": r["similarity_score"],
+                "created_at": r["created_at"].strftime("%Y-%m-%d %H:%M:%S") if r["created_at"] else None,
             })
 
-        return jsonify({
-            "status": "success",
-            "count": len(result),
-            "data": result
-        })
+        resp = {"status": "success", "page": page, "per_page": per_page, "count": len(result), "data": result}
+        cache.set(cache_key, resp, timeout=30)
+        return jsonify(resp)
+
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
@@ -451,15 +489,21 @@ def get_messages():
     try:
         desa_id = g.desa_id
         role = g.role
+        page = int(request.args.get("page", 1))
+        per_page = int(request.args.get("per_page", 50))  # default 50, tuneable
+        cache_key = f"messages:{desa_id}:{role}:page{page}:per{per_page}"
 
-        print(f"📨 Fetching messages for desa_id: {desa_id} | role: {role}")
+        cached = cache.get(cache_key)
+        if cached:
+            return jsonify(cached), 200
 
         conn = get_connection()
         cursor = conn.cursor(dictionary=True)
 
-        # Jika superadmin → bisa lihat semua laporan
+        offset = (page - 1) * per_page
+
         if role == "superadmin":
-            cursor.execute("""
+            cursor.execute(f"""
                 SELECT 
                     m.id, m.desa_id, m.description, m.category, m.tts_url,
                     m.latitude, m.longitude, m.created_at,
@@ -468,10 +512,10 @@ def get_messages():
                 FROM messages m
                 JOIN user u ON m.user_id = u.id
                 ORDER BY m.created_at DESC
-            """)
+                LIMIT %s OFFSET %s
+            """, (per_page, offset))
         else:
-            # Admin dan User: hanya laporan dari desanya sendiri
-            cursor.execute("""
+            cursor.execute(f"""
                 SELECT 
                     m.id, m.desa_id, m.description, m.category, m.tts_url,
                     m.latitude, m.longitude, m.created_at,
@@ -481,15 +525,13 @@ def get_messages():
                 JOIN user u ON m.user_id = u.id
                 WHERE u.desa_id = %s
                 ORDER BY m.created_at DESC
-            """, (desa_id,))
+                LIMIT %s OFFSET %s
+            """, (desa_id, per_page, offset))
 
         messages = cursor.fetchall()
         cursor.close()
         conn.close()
 
-        print(f"📊 Found {len(messages)} messages for desa_id {desa_id}")
-
-        # Format data agar lebih rapi
         formatted = []
         for msg in messages:
             formatted.append({
@@ -508,17 +550,22 @@ def get_messages():
                     "rw": msg["rw"],
                     "blok": msg["blok"]
                 },
-                # tambahkan URL audio TTS jika ada
                 "tts_url_full": f"http://{os.environ.get('PUBLIC_HOST','192.168.0.99')}:5000/audio/{msg['tts_url']}" if msg["tts_url"] else None
             })
 
-        return jsonify({
+        resp = {
             "success": True,
             "desa_id": desa_id,
             "role": role,
-            "total": len(formatted),
+            "page": page,
+            "per_page": per_page,
+            "count": len(formatted),
             "data": formatted
-        }), 200
+        }
+
+        # Cache short time (30s default) — tune if necessary
+        cache.set(cache_key, resp, timeout=30)
+        return jsonify(resp), 200
 
     except Exception as e:
         print("❌ ERROR get_messages:", e)
@@ -1419,6 +1466,9 @@ def lapor_cepat():
         conn = get_connection()
         cursor = conn.cursor(dictionary=True)
 
+        # if g.desa_id != desa_id_from_request:
+        #     return jsonify({"error": "akses ditolak"}), 403
+
         # Ambil data user
         cursor.execute("SELECT nama_lengkap, rt, rw, blok FROM user WHERE id=%s", (user_id,))
         user = cursor.fetchone()
@@ -1517,37 +1567,9 @@ def lapor_manual():
             "Mohon bantuan segera."
         )
 
-        # Buat file suara
-        filename = f"laporan_{int(time.time())}.mp3"
-        filepath = os.path.join(AUDIO_DIR, filename)
-        tts = gTTS(text=text, lang="id")
-        tts.save(filepath)
-
-        # Ambil semua device berdasarkan desa_id
+        # Ambil data desa untuk keperluan penyimpanan laporan
         conn = get_connection()
         cursor = conn.cursor(dictionary=True)
-        cursor.execute("SELECT device_ip FROM iot_device WHERE desa_id = %s", (desa_id,))
-        devices = cursor.fetchall()
-
-        if not devices:
-            cursor.close()
-            conn.close()
-            return jsonify({"success": False, "message": "Tidak ada perangkat di desa ini"}), 404
-
-        # Kirim notifikasi ke semua ESP32 dalam desa yang sama
-        notify_data = {"filename": filename, "url": f"http://{request.host}/audio/{filename}"}
-        for device in devices:
-            esp_ip = device["device_ip"]
-            try:
-                response = requests.post(f"http://{esp_ip}/notify", json=notify_data, timeout=5)
-                if response.status_code == 200:
-                    print(f"ESP32 {esp_ip} notified successfully for file: {filename}")
-                else:
-                    print(f"ESP32 {esp_ip} notification failed with code {response.status_code}")
-            except requests.RequestException as e:
-                print(f"Gagal menghubungi ESP32 ({esp_ip}): {e}")
-
-        # Ambil data desa untuk keperluan penyimpanan laporan
         cursor.execute("SELECT code_desa, nama_desa FROM desa WHERE id=%s", (desa_id,))
         desa = cursor.fetchone()
         cursor.close()
@@ -1558,15 +1580,26 @@ def lapor_manual():
 
         code_desa = desa["code_desa"]
 
-        # Simpan laporan & trigger notifikasi
-        result = _save_report(desa_id, user_id, text, filename, code_desa, category)
+        # Buat job background untuk membuat mp3 + simpan + notify ESP
+        # Fungsi worker: worker_tasks.generate_and_send_notifications(report_data)
+        job = rq_queue.enqueue(
+            'worker_tasks.generate_and_send_notifications',
+            {
+                "desa_id": desa_id,
+                "user_id": user_id,
+                "text": text,
+                "code_desa": code_desa,
+                "category": category
+            },
+            job_timeout=300
+        )
 
-        return jsonify(result)
-
-    except Exception as e:
-        print(f"Error di lapor_manual: {e}")
-        return jsonify({"success": False, "message": "Terjadi kesalahan pada server"}), 500
-
+        # Fast response to client
+        return jsonify({
+            "success": True,
+            "message": "Laporan diterima dan sedang diproses (background)",
+            "job_id": job.get_id()
+        }), 202
 
     except Exception as e:
         log_exc("=== ERROR lapor_manual ===")
@@ -1969,24 +2002,26 @@ def upload_news_with_image():
 def get_news():
     try:
         desa_id = g.desa_id
-        print(f"📰 Fetching news for desa_id: {desa_id}")
+        page = int(request.args.get("page", 1))
+        per_page = int(request.args.get("per_page", 20))
+        offset = (page-1) * per_page
+        cache_key = f"news:{desa_id}:page{page}:per{per_page}"
+        cached = cache.get(cache_key)
+        if cached:
+            return jsonify(cached)
+
         conn = get_connection()
         cursor = conn.cursor(dictionary=True)
-
         cursor.execute("""
-            SELECT 
-                id, title, description, image, source, 
-                created_at, visitors, desa_id
-            FROM news 
-            WHERE desa_id = %s 
+            SELECT id, title, description, image, source, created_at, visitors, desa_id
+            FROM news
+            WHERE desa_id = %s
             ORDER BY created_at DESC
-        """, (desa_id,))
-
+            LIMIT %s OFFSET %s
+        """, (desa_id, per_page, offset))
         news_list = cursor.fetchall()
         cursor.close()
         conn.close()
-
-        print(f"📊 Found {len(news_list)} news items for desa_id {desa_id}")
 
         formatted_news = []
         for news in news_list:
@@ -2000,25 +2035,17 @@ def get_news():
                 "visitors": news["visitors"],
                 "desa_id": news["desa_id"]
             }
-
             if news['image']:
                 news_data["image_url"] = f"http://{os.environ.get('PUBLIC_HOST','192.168.0.99')}:5000/uploads/{news['image']}"
-
             formatted_news.append(news_data)
 
-        return jsonify({
-            "success": True,
-            "data": formatted_news,
-            "total": len(formatted_news),
-            "desa_id": desa_id
-        })
+        resp = {"success": True, "data": formatted_news, "total": len(formatted_news), "page": page}
+        cache.set(cache_key, resp, timeout=30)
+        return jsonify(resp)
 
     except Exception as e:
         log_exc("=== ERROR get_news ===")
-        return jsonify({
-            "success": False,
-            "message": f"Error: {str(e)}"
-        }), 500
+        return jsonify({"success": False, "message": f"Error: {str(e)}"}), 500
 
 @app.route("/news/<int:news_id>", methods=["GET"])
 @require_auth
