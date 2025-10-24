@@ -1,8 +1,10 @@
 # app.py
 import os
-os.environ["EVENTLET_NO_GREENDNS"] = "yes"
 import eventlet
+import mysql
+os.environ["EVENTLET_NO_GREENDNS"] = "yes"
 eventlet.monkey_patch()  # HARUS di paling atas sebelum import Flask, requests, dll
+from flask_socketio import SocketIO, emit, join_room, leave_room
 
 from dotenv import load_dotenv
 load_dotenv()  # baca file .env lebih awal
@@ -22,12 +24,10 @@ from flask_cors import CORS
 from collections import defaultdict
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
-from flask_socketio import SocketIO, emit
 from models import Reports, ReportDuplicationCheck
 from flask_sqlalchemy import SQLAlchemy
 #import file utils
 from utils import check_similarity
-
 from database_config import get_connection
 from tts_utils import generate_mp3
 
@@ -56,12 +56,11 @@ app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config["SQLALCHEMY_DATABASE_URI"] = (
     f"mysql+pymysql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 )
-app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 from models import db, Reports, ReportDuplicationCheck
 db.init_app(app)
-
 
 # SocketIO pakai eventlet mode
 socketio = SocketIO(
@@ -104,7 +103,7 @@ print("DB_HOST:", os.environ.get("DB_HOST"))
 
 AUDIO_DIR = "audio"
 # ESP32_IP = "http://10.234.3.57:8080"  # Ganti dengan IP ESP32 
-ESP32_IP = "http://10.12.114.191:8080"  # Ganti dengan IP ESP32 
+ESP32_IP = "http://192.168.0.127:8080"  # Ganti dengan IP ESP32 
 
 if not os.path.exists(AUDIO_DIR):
     os.makedirs(AUDIO_DIR)
@@ -131,6 +130,24 @@ def log_exc(prefix=""):
 def publish_mqtt(code_desa, message):
     topic = f"desa/{code_desa}"
     publish.single(topic, message, hostname=MQTT_BROKER, port=MQTT_PORT)
+
+@socketio.on('connect')
+def handle_connect():
+    print("⚡ Client connected")
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    print("❌ Client disconnected")
+
+@socketio.on('join_room')
+def handle_join_room(data):
+    desa_id = data.get('desa_id')
+    user_id = data.get('user_id')
+    if desa_id:
+        join_room(f"desa_{desa_id}")
+        print(f"🟢 User {user_id} joined room desa_{desa_id}")
+    else:
+        print("⚠️ join_room gagal: desa_id kosong")
 
 @app.route('/api/report/create', methods=['POST'])
 def create_report():
@@ -198,13 +215,51 @@ def create_report():
         temp_report.status = classification
         temp_report.similarity_score = similarity_score
         db.session.commit()
+        # Setelah db.session.commit()
+        broadcast_data = {
+            "id": temp_report.id,
+            "jenis_laporan": temp_report.jenis_laporan,
+            "nama_pelapor": temp_report.nama_pelapor,
+            "alamat": temp_report.alamat,
+            "deskripsi": temp_report.deskripsi,
+            "latitude": temp_report.latitude,
+            "longitude": temp_report.longitude,
+            "status": temp_report.status,
+            "created_at": temp_report.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+        broadcast_to_admins(desa_id, "new_report", broadcast_data)
+        print(f"📡 Broadcast laporan baru ke admin desa {desa_id}")
+
+        try:
+            broadcast_data = {
+                "id": temp_report.id,
+                "jenis_laporan": temp_report.jenis_laporan,
+                "nama_pelapor": temp_report.nama_pelapor,
+                "alamat": temp_report.alamat,
+                "deskripsi": temp_report.deskripsi,
+                "latitude": temp_report.latitude,
+                "longitude": temp_report.longitude,
+                "status": temp_report.status,
+                "created_at": temp_report.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+
+            socketio.emit(
+                'new_report',
+                broadcast_data,
+                room=f"desa_{desa_id}"  # 🔥 hanya ke admin di desa yang sama
+            )
+            print(f"📡 SocketIO emit new_report ke room desa_{desa_id}")
+        except Exception as e:
+            print(f"⚠️ Gagal kirim socket event: {e}")
 
         return jsonify({
             "status": "success",
             "message": f"Laporan disimpan sebagai {classification}",
             "similarity_score": similarity_score
         })
-    
+        # === Setelah laporan tersimpan ===
+
     except Exception as e:
         db.session.rollback()
         return jsonify({"status": "error", "message": "Format tanggal salah"}), 400
@@ -698,7 +753,8 @@ def login():
 
     try:
         cursor.execute("""
-            SELECT u.id, u.nama_lengkap, u.email, u.katasandi, u.role, d.code_desa, d.nama_desa, u.desa_id
+            SELECT u.id, u.nama_lengkap, u.email, u.katasandi, u.role, u.rt, u.rw, u.blok,
+                u.desa_id, d.code_desa, d.nama_desa
             FROM user u
             JOIN desa d ON u.desa_id = d.id
             WHERE u.email=%s
@@ -712,15 +768,22 @@ def login():
             return jsonify({"success": False, "message": "Login gagal"}), 401
 
         # Return user info (no JWT)
-        return jsonify({"success": True, "message": "Login berhasil", "user": {
-            "id": user["id"],
-            "nama_lengkap": user["nama_lengkap"],
-            "email": user["email"],
-            "role": user["role"],
-            "desa_id": user["desa_id"],
-            "code_desa": user["code_desa"],
-            "nama_desa": user["nama_desa"]
-        }}), 200
+        return jsonify({
+            "success": True,
+            "message": "Login berhasil",
+            "user": {
+                "id": user["id"],
+                "nama_lengkap": user["nama_lengkap"],
+                "email": user["email"],
+                "role": user["role"],
+                "rt": user["rt"],
+                "rw": user["rw"],
+                "blok": user["blok"],
+                "desa_id": user["desa_id"],
+                "code_desa": user["code_desa"],
+                "nama_desa": user["nama_desa"]
+            }
+        }), 200
 
     except Exception as e:
         log_exc("=== ERROR login ===")
@@ -1175,6 +1238,114 @@ def receive_report():
         print(f"Gagal menghubungi ESP32: {e}")
 
     return jsonify({"status": "success", "filename": filename})
+
+# ==========================================================
+# Endpoint utama laporan
+# ==========================================================
+from models import Reports
+from sqlalchemy import text
+
+@app.route("/reports", methods=["POST"])
+def receive_reports():
+    try:
+        data = request.get_json()
+        required_fields = ["nama", "rt", "rw", "blok", "kategori", "code_desa"]
+        if not all(field in data for field in required_fields):
+            return jsonify({"error": "Data tidak lengkap"}), 400
+
+        code_desa = data["code_desa"]
+
+        # Ambil data perangkat ESP berdasarkan kode desa
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT i.device_ip, i.device_id, d.code_desa, d.nama_desa, i.description
+            FROM iot_device i
+            JOIN desa d ON i.desa_id = d.id
+            WHERE d.code_desa = %s
+        """, (code_desa,))
+        devices = cursor.fetchall()
+        cursor.close()
+        conn.close()
+
+        if not devices:
+            return jsonify({"error": f"Tidak ada perangkat ESP untuk kode desa {code_desa}"}), 404
+
+        # Buat teks laporan
+        text_report = (
+            f"Telah terjadi {data['kategori']}. "
+            f"Di rumah {data['nama']}, RT {data['rt']}, RW {data['rw']}, Blok {data['blok']}. "
+            f"Warga {devices[0]['nama_desa']} harap segera membantu."
+        )
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"report_{code_desa}_{timestamp}.mp3"
+        filepath = os.path.join(AUDIO_DIR, filename)
+
+        tts = gTTS(text=text_report, lang="id")
+        tts.save(filepath)
+        audio_url = f"http://{request.host}/audio/{filename}"
+
+        results = []
+
+        # 💡 fix eventlet bug: pakai socket asli untuk sementara
+        import socket  # pakai socket asli Python
+
+        eventlet.sleep(0)  # biar tidak blocking event loop
+
+        for dev in devices:
+            esp_ip = dev["device_ip"]
+            notify_data = {"filename": filename, "url": audio_url}
+
+            try:
+                # gunakan requests asli tanpa eventlet
+                import requests
+                s = requests.Session()
+                adapter = requests.adapters.HTTPAdapter(max_retries=1)
+                s.mount("http://", adapter)
+                s.mount("https://", adapter)
+
+                resp = s.post(
+                    f"http://{esp_ip}:8080/notify",
+                    json=notify_data,
+                    timeout=5
+                )
+
+                if resp.status_code == 200:
+                    print(f"✅ Notifikasi terkirim ke {esp_ip} ({dev['description']})")
+                    results.append({"ip": esp_ip, "status": "success"})
+                else:
+                    print(f"⚠️ ESP di {esp_ip} gagal: {resp.status_code}")
+                    results.append({"ip": esp_ip, "status": "failed"})
+            except Exception as e:
+                print(f"❌ Tidak bisa menghubungi {esp_ip}: {e}")
+                results.append({"ip": esp_ip, "status": "offline"})
+
+
+        # Simpan laporan
+        new_report = Reports(
+            user_id=data.get("user_id"),
+            jenis_laporan=data["kategori"],
+            nama_pelapor=data["nama"],
+            alamat=f"RT {data['rt']}/RW {data['rw']} Blok {data['blok']}",
+            status="baru",
+            created_at=datetime.now(),
+        )
+        db.session.add(new_report)
+        db.session.commit()
+
+        return jsonify({
+            "status": "done",
+            "desa": code_desa,
+            "file": filename,
+            "audio_url": audio_url,
+            "results": results
+        }), 200
+
+    except Exception as e:
+        print("❌ ERROR di /reports:", e)
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/audio/<path:filename>")
 def serve_audio(filename):
@@ -1779,32 +1950,32 @@ def laporan_terbaru_admin():
         }
     })
 
-# @app.errorhandler(422)
-# def handle_unprocessable_entity(err):
-#     return jsonify({
-#         "success": False,
-#         "message": "Request tidak valid atau hilang",
-#         "detail": str(err)
-#     }), 422
+@app.errorhandler(422)
+def handle_unprocessable_entity(err):
+    return jsonify({
+        "success": False,
+        "message": "Request tidak valid atau hilang",
+        "detail": str(err)
+    }), 422
 
-# @app.route('/get-audio/<filename>', methods=['GET'])
-# def get_audio(filename):
-#     filepath = os.path.join(AUDIO_FOLDER, filename)
-#     if not os.path.exists(filepath):
-#         return jsonify({"error": "File tidak ditemukan"}), 404
+@app.route('/get-audio/<filename>', methods=['GET'])
+def get_audio(filename):
+    filepath = os.path.join(AUDIO_DIR, filename)
+    if not os.path.exists(filepath):
+        return jsonify({"error": "File tidak ditemukan"}), 404
 
-#     play_count[filename] += 1
-#     if play_count[filename] >= 3:
-#         resp = send_file(filepath, mimetype='audio/mpeg', as_attachment=True)
-#         try:
-#             time.sleep(2)
-#             os.remove(filepath)
-#             del play_count[filename]
-#         except Exception:
-#             pass
-#         return resp
-#     else:
-#         return send_file(filepath, mimetype='audio/mpeg')
+    play_count[filename] += 1
+    if play_count[filename] >= 3:
+        resp = send_file(filepath, mimetype='audio/mpeg', as_attachment=True)
+        try:
+            time.sleep(2)
+            os.remove(filepath)
+            del play_count[filename]
+        except Exception:
+            pass
+        return resp
+    else:
+        return send_file(filepath, mimetype='audio/mpeg')
 
 
 @app.route('/hapus/<filename>', methods=["GET"])
@@ -2378,8 +2549,12 @@ if 'ping_timeout' not in inspect.signature(eventlet.wsgi.server).parameters:
 # ==========================
 # Main Runner
 # ==========================
+
 if __name__ == "__main__":
+    import eventlet
+    eventlet.monkey_patch()
     print("🚀 Server berjalan di http://0.0.0.0:5000")
+
     socketio.run(
         app,
         host="0.0.0.0",
