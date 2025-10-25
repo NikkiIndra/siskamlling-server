@@ -1342,6 +1342,7 @@ def receive_reports():
         # Simpan laporan
         new_report = Reports(
             user_id=data.get("user_id"),
+            desa_id=data.get("desa_id"), 
             jenis_laporan=data["kategori"],
             nama_pelapor=data["nama"],
             alamat=f"RT {data['rt']}/RW {data['rw']} Blok {data['blok']}",
