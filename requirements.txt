@@ -16,5 +16,5 @@ urllib3==2.0.7
 python-dotenv==1.0.0
 geopy==2.3.0
 pymysql==1.1.0
-redis rq flask-caching
+redis
 # pip install -r requirements.txt

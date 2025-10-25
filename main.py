@@ -38,8 +38,8 @@ import inspect
 # APP & CONFIG INIT
 # ==========================
 app = Flask(__name__)
-# keep original CORS config from your file
-CORS(app, supports_credentials=True)
+
+CORS(app, supports_credentials=True, origins=["http://localhost:5000", "http://192.168.137.49:5000"]);
 
 DB_USER = os.getenv("DB_USER", "root")
 DB_PASS = os.getenv("DB_PASS", "")
@@ -792,6 +792,23 @@ def login():
         cursor.close()
         conn.close()
 
+# -- GET DESA BY ID --
+@app.route("/desa/<int:desa_id>", methods=["GET"])
+def get_desa(desa_id):
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT id, code_desa, nama_desa FROM desa WHERE id = %s", (desa_id,))
+        desa = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        
+        if desa:
+            return jsonify(desa)
+        else:
+            return jsonify({"error": "Desa tidak ditemukan"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 # -------------------------
 # 4. forgot_password (user)
 # -------------------------
@@ -1424,7 +1441,6 @@ def send_esp_notification(device_ip, filename, play_count):
 def _save_report(desa_id, user_id, text, filename, code_desa, category):
     conn = get_connection()
     cursor = conn.cursor(dictionary=True, buffered=True)
-
     try:
         # Simpan laporan ke tabel messages
         cursor.execute("""

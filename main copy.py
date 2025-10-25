@@ -76,10 +76,8 @@ app.config["SQLALCHEMY_DATABASE_URI"] = (
 )
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
-
 from models import db, Reports, ReportDuplicationCheck
 db.init_app(app)
-
 
 # SocketIO pakai eventlet mode
 socketio = SocketIO(
@@ -187,7 +185,6 @@ def create_report():
                 foto_url = f"/static/uploads/{filename}"
 
         # Create temporary report quick
-        # ly with status 'pending'
         temp_report = Reports(
             user_id=user_id,
             desa_id=desa_id,
