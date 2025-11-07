@@ -18,19 +18,18 @@ import paho.mqtt.publish as publish
 from gtts import gTTS
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from datetime import datetime
+from datetime import datetime, timezone
 from flask import Flask, request, jsonify, send_file, send_from_directory, g
 from flask_cors import CORS
 from collections import defaultdict
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
-from models import Reports, ReportDuplicationCheck
+from models import Reports, ReportDuplicationCheck, Messages 
 from flask_sqlalchemy import SQLAlchemy
 #import file utils
 from utils import check_similarity
 from database_config import get_connection
 from tts_utils import generate_mp3
-
 import eventlet.wsgi
 import inspect
 
@@ -152,45 +151,46 @@ def handle_join_room(data):
 @app.route('/api/report/create', methods=['POST'])
 def create_report():
     try:
-        jenis_laporan = request.form.get('jenis_laporan')
-        nama_pelapor = request.form.get('nama_pelapor')
-        alamat = request.form.get('alamat')
-        deskripsi = request.form.get('deskripsi')
-        tanggal_str = request.form.get('tanggal')  # '2025-10-20'
-        tanggal = datetime.strptime(tanggal_str, '%Y-%m-%d')
-        latitude = float(request.form.get('latitude'))
-        longitude = float(request.form.get('longitude'))
-        desa_id = int(request.form.get('desa_id'))
-        user_id = int(request.form.get('user_id'))
+        # Ambil data dari form
+        form = request.form
+        print("📥 Data form diterima:", form.to_dict())
 
+        jenis_laporan = form.get('jenis_laporan', 'Umum')
+        nama_pelapor = form.get('nama_pelapor', '')
+        alamat = form.get('alamat', '')
+        deskripsi = form.get('deskripsi', '')
+        tanggal_str = form.get('tanggal')
+        desa_id = int(form.get('desa_id', 0))
+        user_id = int(form.get('user_id', 0))
+        latitude = float(form.get('latitude', 0))
+        longitude = float(form.get('longitude', 0))
+
+        # Validasi minimal
         if not desa_id or not user_id:
             return jsonify({"status": "error", "message": "desa_id atau user_id kosong"}), 400
 
-        desa_id = int(desa_id)
-        user_id = int(user_id)
-        print("🛰️ Kirim laporan:");
-        print("desa_id: $desaId, user_id: $userId");
-        print("latitude: $latitude, longitude: $longitude");
-        print("images: ${imageFiles.length}");
-        # Cek apakah user berhak melapor ke desa_id tersebut
-        # (misal pakai session auth: desa user harus sama)
+        # Parsing tanggal
+        tanggal = datetime.strptime(tanggal_str, '%Y-%m-%d') if tanggal_str else datetime.utcnow()
+
+        # Cek header desa untuk keamanan (opsional)
         header_desa = request.headers.get("X-Desa-Id")
         if header_desa and int(header_desa) != desa_id:
             return jsonify({"status": "error", "message": "Akses ditolak: desa tidak cocok"}), 403
 
         # Upload foto
-        fotos = request.files.getlist('images')
         foto_url = None
+        fotos = request.files.getlist('images')
         if fotos:
             for foto in fotos:
                 filename = f"{uuid.uuid4().hex}_{secure_filename(foto.filename)}"
-                foto.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
+                filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+                foto.save(filepath)
                 foto_url = f"/static/uploads/{filename}"
 
-        # Ambil semua laporan dari desa yang sama
+        # Ambil semua laporan di desa yang sama
         all_reports = Reports.query.filter_by(desa_id=desa_id).all()
 
-        # Buat sementara objek report_id untuk relasi check table
+        # Buat laporan baru
         temp_report = Reports(
             user_id=user_id,
             desa_id=desa_id,
@@ -207,7 +207,23 @@ def create_report():
         db.session.add(temp_report)
         db.session.flush()
 
-        # Cek duplikasi dan simpan hasil ke tabel check
+        # Simpan juga ke tabel messages (tanpa device_id)
+        new_message = Messages(
+            desa_id=desa_id,
+            user_id=user_id,
+            description=deskripsi or "Tidak ada deskripsi",
+            category=jenis_laporan or "Umum",
+            tts_url="",
+            latitude=latitude,
+            longitude=longitude,
+            created_at=datetime.now(timezone.utc)
+        )
+        db.session.add(new_message)
+        db.session.commit()
+
+        print(f"📩 Pesan disimpan ke tabel messages (ID: {new_message.id})")
+
+        # Cek duplikasi
         similarity_score, classification = check_similarity(
             jenis_laporan, latitude, longitude, deskripsi, all_reports, temp_report.id
         )
@@ -215,7 +231,8 @@ def create_report():
         temp_report.status = classification
         temp_report.similarity_score = similarity_score
         db.session.commit()
-        # Setelah db.session.commit()
+
+        # Broadcast ke admin dan SocketIO
         broadcast_data = {
             "id": temp_report.id,
             "jenis_laporan": temp_report.jenis_laporan,
@@ -229,40 +246,20 @@ def create_report():
         }
 
         broadcast_to_admins(desa_id, "new_report", broadcast_data)
-        print(f"📡 Broadcast laporan baru ke admin desa {desa_id}")
-
-        try:
-            broadcast_data = {
-                "id": temp_report.id,
-                "jenis_laporan": temp_report.jenis_laporan,
-                "nama_pelapor": temp_report.nama_pelapor,
-                "alamat": temp_report.alamat,
-                "deskripsi": temp_report.deskripsi,
-                "latitude": temp_report.latitude,
-                "longitude": temp_report.longitude,
-                "status": temp_report.status,
-                "created_at": temp_report.created_at.strftime("%Y-%m-%d %H:%M:%S"),
-            }
-
-            socketio.emit(
-                'new_report',
-                broadcast_data,
-                room=f"desa_{desa_id}"  # 🔥 hanya ke admin di desa yang sama
-            )
-            print(f"📡 SocketIO emit new_report ke room desa_{desa_id}")
-        except Exception as e:
-            print(f"⚠️ Gagal kirim socket event: {e}")
+        socketio.emit('new_report', broadcast_data, room=f"desa_{desa_id}")
+        print(f"📡 Broadcast laporan baru ke admin dan room desa_{desa_id}")
 
         return jsonify({
             "status": "success",
             "message": f"Laporan disimpan sebagai {classification}",
             "similarity_score": similarity_score
         })
-        # === Setelah laporan tersimpan ===
 
     except Exception as e:
         db.session.rollback()
-        return jsonify({"status": "error", "message": "Format tanggal salah"}), 400
+        print(f"❌ ERROR create_report: {e}")
+        import traceback; traceback.print_exc()
+        return jsonify({"status": "error", "message": str(e)}), 400
 
 @app.route('/api/report/list', methods=['GET'])
 def get_reports_by_desa():
@@ -433,10 +430,20 @@ def require_auth(f):
 
         return f(*args, **kwargs)
     return decorated
+
+@app.route('/api/report/mark_handled/<int:report_id>', methods=['POST'])
+def mark_report_handled(report_id):
+    report = Reports.query.get(report_id)
+    if not report:
+        return jsonify({"status": "error", "message": "Laporan tidak ditemukan"}), 404
+    
+    report.status = "ditangani"
+    db.session.commit()
+    return jsonify({"status": "success", "message": "Laporan ditandai selesai"})
+
 # =====================================================
 # ROUTES (only JWT-related logic removed; rest preserved)
 # =====================================================
-
 @app.route("/users", methods=["GET"])
 @require_auth
 def get_users():
@@ -585,49 +592,62 @@ def get_messages():
 # -------------------------
 # GET ONLY COORDINATES (for map / trend report)
 # -------------------------
-@app.route("/messages/coords", methods=["GET"])
+@app.route("/messages/chart-data", methods=["GET"])
 @require_auth
-def get_message_coords():
+def get_chart_data():
     try:
         desa_id = g.desa_id
         role = g.role
 
-        print(f"📨 Fetching coordinates for desa_id: {desa_id} | role: {role}")
-
         conn = get_connection()
         cursor = conn.cursor(dictionary=True)
 
-        if role == "superadmin":
+        if role == "admin":
             cursor.execute("""
-                SELECT m.id, m.latitude, m.longitude, m.desa_id
-                FROM messages m
-                WHERE m.latitude IS NOT NULL AND m.longitude IS NOT NULL
+                SELECT 
+                    DATE_FORMAT(created_at, '%b') AS month,
+                    SUM(CASE WHEN category = 'kemalingan' THEN 1 ELSE 0 END) AS kemalingan,
+                    SUM(CASE WHEN category = 'medis' THEN 1 ELSE 0 END) AS medis,
+                    SUM(CASE WHEN category = 'kebakaran' THEN 1 ELSE 0 END) AS kebakaran
+                FROM (
+                    SELECT category, created_at, desa_id FROM messages
+                    UNION ALL
+                    SELECT jenis_laporan AS category, created_at, desa_id FROM reports
+                ) AS combined
+                GROUP BY MONTH(created_at)
+                ORDER BY MONTH(created_at)
             """)
         else:
             cursor.execute("""
-                SELECT m.id, m.latitude, m.longitude, m.desa_id
-                FROM messages m
-                JOIN user u ON m.user_id = u.id
-                WHERE u.desa_id = %s
-                AND m.latitude IS NOT NULL AND m.longitude IS NOT NULL
+                SELECT 
+                    DATE_FORMAT(created_at, '%b') AS month,
+                    SUM(CASE WHEN category = 'kemalingan' THEN 1 ELSE 0 END) AS kemalingan,
+                    SUM(CASE WHEN category = 'medis' THEN 1 ELSE 0 END) AS medis,
+                    SUM(CASE WHEN category = 'kebakaran' THEN 1 ELSE 0 END) AS kebakaran
+                FROM (
+                    SELECT category, created_at, desa_id FROM messages
+                    UNION ALL
+                    SELECT jenis_laporan AS category, created_at, desa_id FROM reports
+                ) AS combined
+                WHERE desa_id = %s
+                GROUP BY MONTH(created_at)
+                ORDER BY MONTH(created_at)
             """, (desa_id,))
 
-        messages = cursor.fetchall()
+        data = cursor.fetchall()
         cursor.close()
         conn.close()
 
-        print(f"📊 Found {len(messages)} coordinates for desa_id {desa_id}")
-
         return jsonify({
             "success": True,
-            "data": messages
+            "data": data
         }), 200
 
     except Exception as e:
-        print("❌ ERROR get_message_coords:", e)
+        print("❌ ERROR get_chart_data:", e)
         return jsonify({
             "success": False,
-            "message": f"Error: {str(e)}"
+            "message": str(e)
         }), 500
 
 # -------------------------
@@ -1262,8 +1282,10 @@ def receive_report():
 from models import Reports
 from sqlalchemy import text
 
-@app.route("/reports", methods=["POST"])
+@app.route("/reports", methods=["POST"], strict_slashes=False)
 def receive_reports():
+    print("📡 Diterima request:", request.path)
+
     try:
         data = request.get_json()
         required_fields = ["nama", "rt", "rw", "blok", "kategori", "code_desa"]
@@ -1346,6 +1368,8 @@ def receive_reports():
             jenis_laporan=data["kategori"],
             nama_pelapor=data["nama"],
             alamat=f"RT {data['rt']}/RW {data['rw']} Blok {data['blok']}",
+            latitude=0.0,
+            longitude=0.0,
             status="baru",
             created_at=datetime.now(),
         )
@@ -2359,6 +2383,10 @@ def get_news_statistics():
 # -------------------------
 # GET REPORT SUMMARY (Today, Week, Month) - VERSI ALTERNATIF
 # -------------------------
+# ===========================
+# GET REPORT SUMMARY (Today, Week, Month, Year)
+# ===========================
+
 @app.route("/messages/summary", methods=["GET"])
 @require_auth
 def get_report_summary():
@@ -2366,82 +2394,80 @@ def get_report_summary():
         desa_id = g.desa_id
         role = g.role
 
-        print(f"📊 Fetching report summary for desa_id: {desa_id}")
-
         conn = get_connection()
         cursor = conn.cursor(dictionary=True)
+        cursor.execute("SET time_zone = '+07:00'")
 
-        # Nama bulan dalam bahasa Indonesia
         month_names = {
             1: 'Januari', 2: 'Februari', 3: 'Maret', 4: 'April',
             5: 'Mei', 6: 'Juni', 7: 'Juli', 8: 'Agustus',
             9: 'September', 10: 'Oktober', 11: 'November', 12: 'Desember'
         }
 
-        # Base condition untuk filter desa
-        desa_condition = "WHERE u.desa_id = %s" if role != "superadmin" else ""
-        params = [desa_id] if role != "superadmin" else []
+        join_clause = "JOIN user u ON m.user_id = u.id"
+        where_clause = "WHERE u.desa_id = %s"
+        params = [desa_id]
 
-        # Hitung hari ini
-        today_query = f"""
-            SELECT COUNT(*) as count 
+        if role == "superadmin":
+            join_clause = ""
+            where_clause = "WHERE 1=1"
+            params = []
+
+        # Hari ini
+        cursor.execute(f"""
+            SELECT COUNT(*) AS count
             FROM messages m
-            {"JOIN user u ON m.user_id = u.id" if role != "superadmin" else ""}
-            {desa_condition}
-            AND DATE(m.created_at) = CURDATE()
-        """
-        cursor.execute(today_query, params)
-        today_result = cursor.fetchone()
-        today_count = today_result['count'] if today_result else 0
+            {join_clause}
+            {where_clause}
+            AND DATE(CONVERT_TZ(m.created_at, '+00:00', '+07:00')) = CURDATE()
+        """, params)
+        today_count = cursor.fetchone()['count']
 
-        # Hitung minggu ini (minggu dalam bulan)
-        current_day = datetime.now().day
+        # Data waktu sekarang
+        now = datetime.now()
+        current_day = now.day
+        current_month = now.month
+        current_year = now.year
         current_week = ((current_day - 1) // 7) + 1
-        
-        # Tentukan awal dan akhir minggu
-        week_start_day = ((current_week - 1) * 7) + 1
-        week_end_day = min(current_week * 7, 31)
-        
-        # Dapatkan tahun dan bulan saat ini
-        current_year = datetime.now().year
-        current_month = datetime.now().month
-        
-        # Buat tanggal untuk minggu ini
-        week_start = datetime(current_year, current_month, week_start_day)
-        week_end = datetime(current_year, current_month, week_end_day)
-        
-        # Hitung laporan minggu ini
-        week_query = f"""
-            SELECT COUNT(*) as count 
-            FROM messages m
-            {"JOIN user u ON m.user_id = u.id" if role != "superadmin" else ""}
-            {desa_condition}
-            AND DATE(m.created_at) BETWEEN %s AND %s
-        """
-        week_params = params + [week_start.date(), week_end.date()]
-        cursor.execute(week_query, week_params)
-        week_result = cursor.fetchone()
-        week_count = week_result['count'] if week_result else 0
 
-        # Hitung bulan ini
-        month_query = f"""
-            SELECT COUNT(*) as count 
+        # Minggu ini
+        week_start_day = (current_week - 1) * 7 + 1
+        week_end_day = min(current_week * 7, 31)
+        week_start_date = datetime(current_year, current_month, week_start_day).date()
+        week_end_date = datetime(current_year, current_month, week_end_day).date()
+
+        cursor.execute(f"""
+            SELECT COUNT(*) AS count
             FROM messages m
-            {"JOIN user u ON m.user_id = u.id" if role != "superadmin" else ""}
-            {desa_condition}
-            AND MONTH(m.created_at) = MONTH(CURDATE()) 
-            AND YEAR(m.created_at) = YEAR(CURDATE())
-        """
-        cursor.execute(month_query, params)
-        month_result = cursor.fetchone()
-        month_count = month_result['count'] if month_result else 0
+            {join_clause}
+            {where_clause}
+            AND DATE(CONVERT_TZ(m.created_at, '+00:00', '+07:00')) BETWEEN %s AND %s
+        """, params + [week_start_date, week_end_date])
+        week_count = cursor.fetchone()['count']
+
+        # Bulan ini
+        cursor.execute(f"""
+            SELECT COUNT(*) AS count
+            FROM messages m
+            {join_clause}
+            {where_clause}
+            AND MONTH(CONVERT_TZ(m.created_at, '+00:00', '+07:00')) = MONTH(CONVERT_TZ(NOW(), '+00:00', '+07:00'))
+            AND YEAR(CONVERT_TZ(m.created_at, '+00:00', '+07:00')) = YEAR(CONVERT_TZ(NOW(), '+00:00', '+07:00'))
+        """, params)
+        month_count = cursor.fetchone()['count']
+
+        # Tahun ini
+        cursor.execute(f"""
+            SELECT COUNT(*) AS count
+            FROM messages m
+            {join_clause}
+            {where_clause}
+            AND YEAR(CONVERT_TZ(m.created_at, '+00:00', '+07:00')) = YEAR(CONVERT_TZ(NOW(), '+00:00', '+07:00'))
+        """, params)
+        year_total = cursor.fetchone()['count']
 
         cursor.close()
         conn.close()
-
-        month_name = month_names.get(current_month, 'Bulan')
-
-        print(f"📊 Summary - Today: {today_count}, Week {current_week}: {week_count}, Month: {month_count}")
 
         return jsonify({
             "success": True,
@@ -2449,9 +2475,10 @@ def get_report_summary():
                 "today": today_count,
                 "week": week_count,
                 "month": month_count,
+                "year_total": year_total,
                 "current_week": f"Minggu-{current_week}",
-                "current_month": month_name,
-                "year": current_year
+                "current_month": month_names.get(current_month, 'Bulan'),
+                "current_year": current_year
             }
         }), 200
 
@@ -2461,7 +2488,7 @@ def get_report_summary():
             "success": False,
             "message": f"Error: {str(e)}"
         }), 500
-    
+
 # -------------------------
 # GET CHART DATA FOR TREND ANALYSIS
 # -------------------------
