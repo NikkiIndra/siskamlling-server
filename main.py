@@ -592,62 +592,49 @@ def get_messages():
 # -------------------------
 # GET ONLY COORDINATES (for map / trend report)
 # -------------------------
-@app.route("/messages/chart-data", methods=["GET"])
+@app.route("/messages/coords", methods=["GET"])
 @require_auth
-def get_chart_data():
+def get_message_coords():
     try:
         desa_id = g.desa_id
         role = g.role
 
+        print(f"📨 Fetching coordinates for desa_id: {desa_id} | role: {role}")
+
         conn = get_connection()
         cursor = conn.cursor(dictionary=True)
 
-        if role == "admin":
+        if role == "superadmin":
             cursor.execute("""
-                SELECT 
-                    DATE_FORMAT(created_at, '%b') AS month,
-                    SUM(CASE WHEN category = 'kemalingan' THEN 1 ELSE 0 END) AS kemalingan,
-                    SUM(CASE WHEN category = 'medis' THEN 1 ELSE 0 END) AS medis,
-                    SUM(CASE WHEN category = 'kebakaran' THEN 1 ELSE 0 END) AS kebakaran
-                FROM (
-                    SELECT category, created_at, desa_id FROM messages
-                    UNION ALL
-                    SELECT jenis_laporan AS category, created_at, desa_id FROM reports
-                ) AS combined
-                GROUP BY MONTH(created_at)
-                ORDER BY MONTH(created_at)
+                SELECT m.id, m.latitude, m.longitude, m.desa_id
+                FROM messages m
+                WHERE m.latitude IS NOT NULL AND m.longitude IS NOT NULL
             """)
         else:
             cursor.execute("""
-                SELECT 
-                    DATE_FORMAT(created_at, '%b') AS month,
-                    SUM(CASE WHEN category = 'kemalingan' THEN 1 ELSE 0 END) AS kemalingan,
-                    SUM(CASE WHEN category = 'medis' THEN 1 ELSE 0 END) AS medis,
-                    SUM(CASE WHEN category = 'kebakaran' THEN 1 ELSE 0 END) AS kebakaran
-                FROM (
-                    SELECT category, created_at, desa_id FROM messages
-                    UNION ALL
-                    SELECT jenis_laporan AS category, created_at, desa_id FROM reports
-                ) AS combined
-                WHERE desa_id = %s
-                GROUP BY MONTH(created_at)
-                ORDER BY MONTH(created_at)
+                SELECT m.id, m.latitude, m.longitude, m.desa_id
+                FROM messages m
+                JOIN user u ON m.user_id = u.id
+                WHERE u.desa_id = %s
+                AND m.latitude IS NOT NULL AND m.longitude IS NOT NULL
             """, (desa_id,))
 
-        data = cursor.fetchall()
+        messages = cursor.fetchall()
         cursor.close()
         conn.close()
 
+        print(f"📊 Found {len(messages)} coordinates for desa_id {desa_id}")
+
         return jsonify({
             "success": True,
-            "data": data
+            "data": messages
         }), 200
 
     except Exception as e:
-        print("❌ ERROR get_chart_data:", e)
+        print("❌ ERROR get_message_coords:", e)
         return jsonify({
             "success": False,
-            "message": str(e)
+            "message": f"Error: {str(e)}"
         }), 500
 
 # -------------------------
@@ -2490,7 +2477,7 @@ def get_report_summary():
         }), 500
 
 # -------------------------
-# GET CHART DATA FOR TREND ANALYSIS
+# GET CHART DATA (MESSAGES + REPORTS)
 # -------------------------
 @app.route("/messages/chart-data", methods=["GET"])
 @require_auth
@@ -2499,48 +2486,71 @@ def get_chart_data():
         desa_id = g.desa_id
         role = g.role
 
-        print(f"📊 Fetching chart data for desa_id: {desa_id} | role: {role}")
+        print(f"📊 Fetching combined chart data for desa_id: {desa_id} | role: {role}")
 
         conn = get_connection()
         cursor = conn.cursor(dictionary=True)
 
-        # Query untuk mendapatkan data per bulan dengan kategori
-        if role == "superadmin":
+        # ======================
+        # QUERY UNTUK ADMIN
+        # ======================
+        if role == "admin":
             cursor.execute("""
                 SELECT 
-                    DATE_FORMAT(created_at, '%Y-%m') as month,
-                    SUM(CASE WHEN category = 'kemalingan' THEN 1 ELSE 0 END) as kemalingan,
-                    SUM(CASE WHEN category = 'medis' THEN 1 ELSE 0 END) as medis,
-                    SUM(CASE WHEN category = 'kebakaran' THEN 1 ELSE 0 END) as kebakaran,
-                    COUNT(*) as total
-                FROM messages 
-                WHERE created_at >= DATE_SUB(NOW(), INTERVAL 6 MONTH)
+                    DATE_FORMAT(created_at, '%Y-%m') AS month,
+                    SUM(CASE WHEN category = 'kemalingan' THEN 1 ELSE 0 END) AS kemalingan,
+                    SUM(CASE WHEN category = 'medis' THEN 1 ELSE 0 END) AS medis,
+                    SUM(CASE WHEN category = 'kebakaran' THEN 1 ELSE 0 END) AS kebakaran,
+                    COUNT(*) AS total
+                FROM (
+                    SELECT category, created_at FROM messages
+                    WHERE created_at >= DATE_SUB(NOW(), INTERVAL 6 MONTH)
+                    
+                    UNION ALL
+                    
+                    SELECT jenis_laporan AS category, created_at FROM reports
+                    WHERE created_at >= DATE_SUB(NOW(), INTERVAL 6 MONTH)
+                ) AS combined
                 GROUP BY DATE_FORMAT(created_at, '%Y-%m')
                 ORDER BY month ASC
             """)
+
+        # ======================
+        # QUERY UNTUK USER DESA
+        # ======================
         else:
             cursor.execute("""
                 SELECT 
-                    DATE_FORMAT(m.created_at, '%Y-%m') as month,
-                    SUM(CASE WHEN m.category = 'kemalingan' THEN 1 ELSE 0 END) as kemalingan,
-                    SUM(CASE WHEN m.category = 'medis' THEN 1 ELSE 0 END) as medis,
-                    SUM(CASE WHEN m.category = 'kebakaran' THEN 1 ELSE 0 END) as kebakaran,
-                    COUNT(*) as total
-                FROM messages m
-                JOIN user u ON m.user_id = u.id
-                WHERE u.desa_id = %s 
-                AND m.created_at >= DATE_SUB(NOW(), INTERVAL 6 MONTH)
-                GROUP BY DATE_FORMAT(m.created_at, '%Y-%m')
+                    DATE_FORMAT(c.created_at, '%Y-%m') AS month,
+                    SUM(CASE WHEN c.category = 'kemalingan' THEN 1 ELSE 0 END) AS kemalingan,
+                    SUM(CASE WHEN c.category = 'medis' THEN 1 ELSE 0 END) AS medis,
+                    SUM(CASE WHEN c.category = 'kebakaran' THEN 1 ELSE 0 END) AS kebakaran,
+                    COUNT(*) AS total
+                FROM (
+                    SELECT m.category, m.created_at, u.desa_id
+                    FROM messages m
+                    JOIN user u ON m.user_id = u.id
+                    WHERE u.desa_id = %s
+                    AND m.created_at >= DATE_SUB(NOW(), INTERVAL 6 MONTH)
+                    
+                    UNION ALL
+                    
+                    SELECT r.jenis_laporan AS category, r.created_at, r.desa_id
+                    FROM reports r
+                    WHERE r.desa_id = %s
+                    AND r.created_at >= DATE_SUB(NOW(), INTERVAL 6 MONTH)
+                ) AS c
+                GROUP BY DATE_FORMAT(c.created_at, '%Y-%m')
                 ORDER BY month ASC
-            """, (desa_id,))
+            """, (desa_id, desa_id))
 
         chart_data = cursor.fetchall()
         cursor.close()
         conn.close()
 
-        print(f"📊 Found {len(chart_data)} months of chart data")
+        print(f"📊 Found {len(chart_data)} months of combined chart data")
 
-        # Format nama bulan dalam bahasa Indonesia
+        # Format nama bulan dalam Bahasa Indonesia
         month_names = {
             '01': 'Jan', '02': 'Feb', '03': 'Mar', '04': 'Apr',
             '05': 'Mei', '06': 'Jun', '07': 'Jul', '08': 'Agu',
@@ -2575,7 +2585,6 @@ def get_chart_data():
             "success": False,
             "message": f"Error: {str(e)}"
         }), 500
-
 
 # ==========================
 # Eventlet server patch (keep as original)
